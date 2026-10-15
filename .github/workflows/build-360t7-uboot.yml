@@ -13,19 +13,21 @@ on:
           - ubootmod
           - nonmbm
       BOOTMODE:
-        description: '启动方式: fit=从 UBI 卷 fit 启动(与旧版 uboot 一致, SWRT/官改固件选这个) / production=新版默认(production+recovery 卷)'
+        description: '启动卷: kernel=SWRT/华硕官改(实测卷名就是 kernel) / fit=旧版 uboot 的 OpenWrt ITB 卷 / production=新版默认'
         required: true
-        default: 'fit'
+        default: 'kernel'
         type: choice
         options:
+          - kernel
           - fit
           - production
       VERSION:
-        description: 'ATF 版本: 2025=最新 / SP1=ATF 20241017(老内核固件更稳) / SP2=ATF 20260123'
+        description: 'ATF 版本: all=三个都编(推荐, 挑能用的) / SP1=ATF 20241017(老内核固件更稳) / 2025=最新 / SP2=ATF 20260123'
         required: false
-        default: 'SP1'
+        default: 'all'
         type: choice
         options:
+          - all
           - SP1
           - 2025
           - SP2
@@ -58,8 +60,7 @@ env:
   TZ: Asia/Shanghai
   MODEL: qihoo_360t7
   VARIANT: ${{ github.event.inputs.VARIANT || 'default' }}
-  BOOTMODE: ${{ github.event.inputs.BOOTMODE || 'fit' }}
-  VERSION: ${{ github.event.inputs.VERSION || 'SP1' }}
+  BOOTMODE: ${{ github.event.inputs.BOOTMODE || 'kernel' }}
   DHCPD: ${{ github.event.inputs.DHCPD || 'true' }}
   SIMG: ${{ github.event.inputs.SIMG || 'true' }}
   NAND_RAW: ${{ github.event.inputs.NAND_RAW || 'false' }}
@@ -70,6 +71,13 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # VERSION=all 时三个 ATF 版本都编, 挑能启动的那个刷
+        version: ${{ fromJSON(github.event.inputs.VERSION == 'all' && '["SP1","2025","SP2"]' || format('["{0}"]', github.event.inputs.VERSION || 'SP1')) }}
+    env:
+      VERSION: ${{ matrix.version }}
 
     steps:
       - name: 检出源码
@@ -114,12 +122,20 @@ jobs:
             echo 'CONFIG_WEBUI_FAILSAFE_CONSOLE=y'
             echo 'CONFIG_WEBUI_FAILSAFE_ENV=y'
             echo 'CONFIG_WEBUI_FAILSAFE_I18N=y'
-            if [ "$BOOTMODE" = "fit" ]; then
-              # 复刻旧版 uboot 的启动方式: 从 UBI 卷 fit 读镜像并 bootm
-              # 新版默认是从 production/recovery 卷启动, SWRT 等官改固件找不到会起不来
-              echo 'CONFIG_USE_BOOTCOMMAND=y'
-              echo 'CONFIG_BOOTCOMMAND="ubi part ubi ; ubi read 0x46000000 fit ; bootm 0x46000000"'
-            fi
+            # 旧版 uboot 默认从 fit 卷启动, 新版默认从 production 卷启动,
+            # 而 SWRT/华硕官改固件的实际卷名是 kernel —— 对不上就起不来
+            case "$BOOTMODE" in
+              kernel)
+                echo 'CONFIG_USE_BOOTCOMMAND=y'
+                echo 'CONFIG_BOOTCOMMAND="ubi part ubi ; ubi read 0x46000000 kernel ; bootm 0x46000000"'
+                ;;
+              fit)
+                echo 'CONFIG_USE_BOOTCOMMAND=y'
+                echo 'CONFIG_BOOTCOMMAND="ubi part ubi ; ubi read 0x46000000 fit ; bootm 0x46000000"'
+                ;;
+              production)
+                ;;   # 保持新版默认(production/recovery 卷)
+            esac
           } >> "$CFG"
           echo "--- 追加的开关 ---"
           tail -20 "$CFG"
@@ -198,5 +214,5 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: 360T7-uboot-2025-${{ env.FILE_DATE }}
+          name: 360T7-uboot-${{ matrix.version }}-${{ env.FILE_DATE }}
           path: bl-mt798x-dhcpd/upload/*
