@@ -12,6 +12,23 @@ on:
           - default
           - ubootmod
           - nonmbm
+      BOOTMODE:
+        description: '启动方式: fit=从 UBI 卷 fit 启动(与旧版 uboot 一致, SWRT/官改固件选这个) / production=新版默认(production+recovery 卷)'
+        required: true
+        default: 'fit'
+        type: choice
+        options:
+          - fit
+          - production
+      VERSION:
+        description: 'ATF 版本: 2025=最新 / SP1=ATF 20241017(老内核固件更稳) / SP2=ATF 20260123'
+        required: false
+        default: 'SP1'
+        type: choice
+        options:
+          - SP1
+          - 2025
+          - SP2
       DHCPD:
         description: '开启 DHCP 服务(电脑自动获取 IP, 无需手动设静态 IP)'
         required: false
@@ -40,8 +57,9 @@ on:
 env:
   TZ: Asia/Shanghai
   MODEL: qihoo_360t7
-  VERSION: 2025
   VARIANT: ${{ github.event.inputs.VARIANT || 'default' }}
+  BOOTMODE: ${{ github.event.inputs.BOOTMODE || 'fit' }}
+  VERSION: ${{ github.event.inputs.VERSION || 'SP1' }}
   DHCPD: ${{ github.event.inputs.DHCPD || 'true' }}
   SIMG: ${{ github.event.inputs.SIMG || 'true' }}
   NAND_RAW: ${{ github.event.inputs.NAND_RAW || 'false' }}
@@ -96,9 +114,15 @@ jobs:
             echo 'CONFIG_WEBUI_FAILSAFE_CONSOLE=y'
             echo 'CONFIG_WEBUI_FAILSAFE_ENV=y'
             echo 'CONFIG_WEBUI_FAILSAFE_I18N=y'
+            if [ "$BOOTMODE" = "fit" ]; then
+              # 复刻旧版 uboot 的启动方式: 从 UBI 卷 fit 读镜像并 bootm
+              # 新版默认是从 production/recovery 卷启动, SWRT 等官改固件找不到会起不来
+              echo 'CONFIG_USE_BOOTCOMMAND=y'
+              echo 'CONFIG_BOOTCOMMAND="ubi part ubi ; ubi read 0x46000000 fit ; bootm 0x46000000"'
+            fi
           } >> "$CFG"
           echo "--- 追加的开关 ---"
-          tail -14 "$CFG"
+          tail -20 "$CFG"
 
       - name: 生成 .config
         run: |
@@ -123,9 +147,15 @@ jobs:
           config_apply CONFIG_BUILD_ATF n
           config_apply CONFIG_BUILD_GPT n
           config_apply CONFIG_COPY_BL2 y
-          config_apply CONFIG_VERSION_2025 y
+          config_apply CONFIG_VERSION_2025 n
           config_apply CONFIG_VERSION_SP1 n
           config_apply CONFIG_VERSION_SP2 n
+          case "$VERSION" in
+            2025) config_apply CONFIG_VERSION_2025 y ;;
+            SP1)  config_apply CONFIG_VERSION_SP1 y ;;
+            SP2)  config_apply CONFIG_VERSION_SP2 y ;;
+            *) echo "未知 VERSION: $VERSION"; exit 1 ;;
+          esac
           config_apply CONFIG_VARIANT_DEFAULT n
           config_apply CONFIG_VARIANT_NONMBM n
           config_apply CONFIG_VARIANT_UBOOTMOD n
@@ -153,7 +183,7 @@ jobs:
         run: |
           cd bl-mt798x-dhcpd
           mkdir -p output
-          make BOARD=qihoo_360t7 VERSION=2025 VARIANT="$VARIANT" MULTI_LAYOUT=0 FIXED_MTDPARTS=1 build 2>&1
+          make BOARD=qihoo_360t7 VERSION="$VERSION" VARIANT="$VARIANT" MULTI_LAYOUT=0 FIXED_MTDPARTS=1 build 2>&1
           echo "FILE_DATE=$(date +%Y.%m.%d-%H%M)" >> $GITHUB_ENV
           echo "=== 产物 ==="
           ls -l output/
