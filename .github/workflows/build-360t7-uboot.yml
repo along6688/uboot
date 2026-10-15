@@ -1,0 +1,172 @@
+name: 360T7 U-Boot 2025 (备份/Factory/DHCP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      VARIANT:
+        description: '分区布局: default=原厂/通用(与你现有分区一致, 推荐) / ubootmod=OpenWrt UBI 布局 / nonmbm=关闭 NMBM'
+        required: true
+        default: 'default'
+        type: choice
+        options:
+          - default
+          - ubootmod
+          - nonmbm
+      DHCPD:
+        description: '开启 DHCP 服务(电脑自动获取 IP, 无需手动设静态 IP)'
+        required: false
+        default: 'true'
+        type: boolean
+      SIMG:
+        description: '开启全片镜像(SIMG)升级'
+        required: false
+        default: 'true'
+        type: boolean
+      NAND_RAW:
+        description: '开启 NAND 原始(OOB)备份, 含坏块信息, 还原最完整但风险高'
+        required: false
+        default: 'false'
+        type: boolean
+      FSTHEME:
+        description: '救援界面主题'
+        required: false
+        default: 'bootstrap'
+        type: choice
+        options:
+          - bootstrap
+          - gl
+          - mtk
+
+env:
+  TZ: Asia/Shanghai
+  MODEL: qihoo_360t7
+  VERSION: 2025
+  VARIANT: ${{ github.event.inputs.VARIANT || 'default' }}
+  DHCPD: ${{ github.event.inputs.DHCPD || 'true' }}
+  SIMG: ${{ github.event.inputs.SIMG || 'true' }}
+  NAND_RAW: ${{ github.event.inputs.NAND_RAW || 'false' }}
+  FSTHEME: ${{ github.event.inputs.FSTHEME || 'bootstrap' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出源码
+        run: |
+          git clone --depth 1 https://github.com/Yuzhii0718/bl-mt798x-dhcpd bl-mt798x-dhcpd
+          echo "SOURCE_SHA=$(git -C bl-mt798x-dhcpd rev-parse HEAD)" >> $GITHUB_ENV
+
+      - name: 安装编译依赖
+        run: |
+          sudo -E apt-get -qq update
+          PKGS="gcc-aarch64-linux-gnu build-essential flex bison libssl-dev device-tree-compiler qemu-user-static rename tar"
+          if [ -f bl-mt798x-dhcpd/depends/ubuntu-22.04 ]; then
+            PKGS="$PKGS $(cat bl-mt798x-dhcpd/depends/ubuntu-22.04)"
+          fi
+          sudo -E apt-get -qq install $PKGS
+          sudo timedatectl set-timezone "$TZ"
+
+      - name: 开启功能开关
+        run: |
+          set -e
+          cd bl-mt798x-dhcpd
+          case "$VARIANT" in
+            default)  CFG=uboot-mtk-20250711/configs/mt7981_qihoo_360t7_defconfig ;;
+            nonmbm)   CFG=uboot-mtk-20250711/configs-nonmbm/mt7981_qihoo_360t7_defconfig ;;
+            ubootmod) CFG=uboot-mtk-20250711/configs-ubi/mt7981_qihoo_360t7_defconfig ;;
+            *) echo "未知 VARIANT: $VARIANT"; exit 1 ;;
+          esac
+          echo "机型配置: $CFG"
+          {
+            echo ''
+            echo '# ===== 360T7 自定义功能 ====='
+            echo 'CONFIG_MTK_WEB_FAILSAFE=y'
+            echo 'CONFIG_MTK_WEB_FAILSAFE_AFTER_BOOT_FAILURE=y'
+            if [ "$DHCPD" = "true" ]; then
+              echo 'CONFIG_MTK_DHCPD=y'
+              echo 'CONFIG_MTK_DHCPD_USE_CONFIG_IP=y'
+            fi
+            echo 'CONFIG_WEBUI_FAILSAFE_BACKUP=y'
+            echo 'CONFIG_WEBUI_FAILSAFE_FACTORY=y'
+            echo 'CONFIG_WEBUI_FAILSAFE_ADVANCED=y'
+            echo 'CONFIG_WEBUI_FAILSAFE_FLASH=y'
+            echo 'CONFIG_WEBUI_FAILSAFE_CONSOLE=y'
+            echo 'CONFIG_WEBUI_FAILSAFE_ENV=y'
+            echo 'CONFIG_WEBUI_FAILSAFE_I18N=y'
+          } >> "$CFG"
+          echo "--- 追加的开关 ---"
+          tail -14 "$CFG"
+
+      - name: 生成 .config
+        run: |
+          set -e
+          cd bl-mt798x-dhcpd
+          touch uboot-mtk-20250711/.config
+          make defconfig 2>&1 || true
+          touch .config
+          config_apply() {
+            local key="$1" value="$2"
+            if [ "$value" = "y" ]; then
+              sed -i "s/^# $key is not set\$/$key=y/" .config
+              grep -q "^$key=" .config || echo "$key=y" >> .config
+            elif [ "$value" = "n" ]; then
+              sed -i "s/^$key=y\$/# $key is not set/" .config
+            else
+              sed -i "s|^$key=.*|$key=$value|" .config
+              grep -q "^$key=" .config || echo "$key=$value" >> .config
+            fi
+          }
+          config_apply CONFIG_BUILD_FIP y
+          config_apply CONFIG_BUILD_ATF n
+          config_apply CONFIG_BUILD_GPT n
+          config_apply CONFIG_COPY_BL2 y
+          config_apply CONFIG_VERSION_2025 y
+          config_apply CONFIG_VERSION_SP1 n
+          config_apply CONFIG_VERSION_SP2 n
+          config_apply CONFIG_VARIANT_DEFAULT n
+          config_apply CONFIG_VARIANT_NONMBM n
+          config_apply CONFIG_VARIANT_UBOOTMOD n
+          config_apply CONFIG_VARIANT_UBI n
+          config_apply CONFIG_VARIANT_OPENWRT n
+          case "$VARIANT" in
+            default)  config_apply CONFIG_VARIANT_DEFAULT y ;;
+            nonmbm)   config_apply CONFIG_VARIANT_NONMBM y ;;
+            ubootmod) config_apply CONFIG_VARIANT_UBOOTMOD y ;;
+          esac
+          config_apply CONFIG_FSTHEME_BOOTSTRAP n
+          config_apply CONFIG_FSTHEME_GL n
+          config_apply CONFIG_FSTHEME_MTK n
+          config_apply "CONFIG_FSTHEME_$(echo "$FSTHEME" | tr '[:lower:]' '[:upper:]')" y
+          config_apply CONFIG_MULTI_LAYOUT n
+          config_apply CONFIG_FIXED_MTDPARTS y
+          config_apply CONFIG_SIMG "$([ "$SIMG" = "true" ] && echo y || echo n)"
+          config_apply CONFIG_NAND_RAW "$([ "$NAND_RAW" = "true" ] && echo y || echo n)"
+          config_apply CONFIG_SILENT y
+          config_apply CONFIG_BUILD_LOG y
+          echo "=== 最终 .config ==="
+          cat .config
+
+      - name: 编译 FIP
+        run: |
+          cd bl-mt798x-dhcpd
+          mkdir -p output
+          make BOARD=qihoo_360t7 VERSION=2025 VARIANT="$VARIANT" MULTI_LAYOUT=0 FIXED_MTDPARTS=1 build 2>&1
+          echo "FILE_DATE=$(date +%Y.%m.%d-%H%M)" >> $GITHUB_ENV
+          echo "=== 产物 ==="
+          ls -l output/
+
+      - name: 整理产物
+        run: |
+          cd bl-mt798x-dhcpd
+          mkdir -p upload
+          cp -r output/* upload/ 2>/dev/null || true
+          ls -l upload/
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: 360T7-uboot-2025-${{ env.FILE_DATE }}
+          path: bl-mt798x-dhcpd/upload/*
