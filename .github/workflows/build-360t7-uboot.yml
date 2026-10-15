@@ -38,7 +38,7 @@ on:
         default: 'true'
         type: boolean
       NOMENU:
-        description: '关掉开机启动菜单: MTK 菜单在 bootdelay 之前就弹出, 菜单项只在 defenvs 里有, 走编译内置 env 时菜单是空的 -> bootcmd 轮不到执行(不自动启动的真凶)'
+        description: '关掉开机启动菜单: MTK 菜单在 bootdelay 之前弹出且可能无限等待, bootcmd 轮不到执行(不自动启动的真凶)。实现方式是给 common/autoboot.c 打补丁, 不动 Kconfig(关 Kconfig 会链接失败或弄坏备份)'
         required: false
         default: 'true'
         type: boolean
@@ -167,35 +167,51 @@ jobs:
             echo '# 避开旧 uboot 残留的 env, 把 env 挪到 u-boot-env 分区后半段' >> "$CFG"
             echo 'CONFIG_ENV_OFFSET=0x40000' >> "$CFG"
           fi
-          # ---- NOMENU: 关掉开机启动菜单 ----
-          # 实测现象: 刷完停在 U-Boot 命令行/菜单, bootcmd 完全没执行。
-          # 原因: AUTOBOOT_MENU_SHOW 的 help 写得很清楚 —— 菜单在"处理 boot delay 之前"
-          #       就启动。而菜单项 bootmenu_0..9 / bootmenu_default / bootmenu_delay
-          #       只存在于 defenvs/qihoo-360t7_env, 我们走编译内置默认 env 时菜单是空的,
-          #       空菜单没有默认项, 就一直卡在那儿, bootcmd 永远轮不到。
-          #       旧版 uboot 没 bootcmd, 靠的就是这个菜单自动探测, 所以没暴露这个问题。
-          # 关掉后: 上电 -> bootdelay 倒计时 -> 直接跑 bootcmd(倒计时可按任意键打断进命令行)。
-          #
-          # ⚠️ 血泪教训: 千万别删 CONFIG_MEDIATEK_BOOTMENU=y 那一行!
-          #   它 select MTD。删掉它 -> MTD=n -> mtdcore.o 不编译 -> 链接阶段
-          #   undefined reference to `mtd_read' / `mtd_write' / `mtd_erase' /
-          #   `mtd_block_isbad' / `mtd_read_oob' 全爆, make 直接 Error 139。
-          #   真正控制"开机弹菜单"的是 AUTOBOOT_MENU_SHOW, 关它就行。
-          if [ "$NOMENU" = "true" ]; then
-            sed -i '/^CONFIG_AUTOBOOT_MENU_SHOW=/d; /^CONFIG_AUTOBOOT_MENU_MTK_SHOW=/d; /^CONFIG_BOOTDELAY=/d' "$CFG"
-            {
-              echo ''
-              echo '# 关掉开机菜单, 让 bootcmd 真正有机会执行'
-              echo '# (不要动 CONFIG_MEDIATEK_BOOTMENU: 它 select MTD, 删了链接会挂)'
-              echo '# CONFIG_AUTOBOOT_MENU_SHOW is not set'
-              echo '# CONFIG_AUTOBOOT_MENU_MTK_SHOW is not set'
-              echo 'CONFIG_BOOTDELAY=2'
-              echo '# 双保险: 显式打开 MTD core, 防止任何 select 链断开'
-              echo 'CONFIG_MTD=y'
-            } >> "$CFG"
+          # ---- 开机菜单: 这里刻意不动任何 Kconfig, 只留 BOOTDELAY ----
+          # 菜单相关的三个宏被源码结构绑死, 单改任意一个都会链接失败(实测):
+          #   1. common/autoboot.c:499  if (IS_ENABLED(CONFIG_AUTOBOOT_MENU_SHOW))
+          #          -> run_command("mtkautoboot") 或 menu_show()
+          #   2. menu_show() 定义在 cmd/bootmenu.c:658 的
+          #          #ifdef CONFIG_AUTOBOOT_MENU_SHOW   里面
+          #   3. cmd_mtkautoboot.c:111 无条件调用 menu_show(),
+          #      它由 CONFIG_MEDIATEK_BOOTMENU 控制编译
+          #      => 关 AUTOBOOT_MENU_SHOW 而留 MEDIATEK_BOOTMENU
+          #         -> undefined reference to `menu_show'
+          #   4. CONFIG_MEDIATEK_BOOTMENU 还 select MTD, 而且管着
+          #      board/mediatek/common/mtd_helper.o —— 网页救援的
+          #      backup.c / upgrade.c 要用 mtd_read_skip_bad /
+          #      gen_mtd_probe_devices / mtd_nmbm_enabled, 全在里面
+          #      => 删 MEDIATEK_BOOTMENU 会把备份和刷机一起弄坏
+          # 所以: 保持这三个宏全开(= 上游原版, 链接必然通过),
+          #       改由下一步给 common/autoboot.c 打一行补丁来跳过菜单。
+          echo 'CONFIG_BOOTDELAY=2' >> "$CFG"
+          echo "--- 追加的开关(末尾) ---"
+          tail -36 "$CFG"
+
+      - name: 关闭开机菜单(源码补丁)
+        run: |
+          set -e
+          cd bl-mt798x-dhcpd
+          AB=uboot-mtk-20250711/common/autoboot.c
+          if [ "$NOMENU" != "true" ]; then
+            echo 'NOMENU=false, 保留开机菜单(适合想用菜单选启动项的场景)'
+            exit 0
           fi
-          echo "--- 追加的开关 ---"
-          tail -28 "$CFG"
+          echo "--- 补丁前 ---"
+          grep -n 'AUTOBOOT_MENU_SHOW' "$AB" || true
+          # bootdelay_process() 里这段在 "s = env_get(bootcmd)" 之前执行,
+          # mtkautoboot 一旦不返回(delay=-1 时无限等待), bootcmd 永远轮不到。
+          # 这里只把判断条件改成 0, 菜单代码本身照常编译 ——
+          # 所以 menu_show 符号还在, 链接不会断, 网页救援也照常工作。
+          sed -i 's|if (IS_ENABLED(CONFIG_AUTOBOOT_MENU_SHOW)) {|if (0) { /* 360T7: 关掉开机菜单, 让 bootcmd 执行 */|' "$AB"
+          echo "--- 补丁后 ---"
+          grep -n 'AUTOBOOT_MENU_SHOW\|if (0)' "$AB" || true
+          if grep -q 'if (0) { /\* 360T7' "$AB"; then
+            echo 'OK  补丁已生效: 上电不再弹菜单'
+          else
+            echo '!!  补丁没打上(源码行可能变了), 刷上还会被菜单挡住'
+            exit 1
+          fi
 
       - name: 修正默认 env 文件(双保险)
         run: |
@@ -210,6 +226,10 @@ jobs:
             echo "修正 $f"
             sed -i '/^bootcmd=/d' "$f"
             printf 'bootcmd=%s\n' "$BCMD" >> "$f"
+            # 上游这份 env 里 bootdelay=0(直接启动, 没法按键打断)。
+            # 留 2 秒窗口: 上电按任意键可进命令行调试, 不按就自动进系统。
+            sed -i '/^bootdelay=/d' "$f"
+            printf 'bootdelay=2\n' >> "$f"
           done
 
       - name: 生成 .config
@@ -279,26 +299,56 @@ jobs:
       - name: 自检编译结果
         run: |
           cd bl-mt798x-dhcpd
+          CFG=uboot-mtk-20250711/.config
+          AUTOCONF=uboot-mtk-20250711/include/config/autoconf.h
+          FAIL=0
+          chk() { # chk <说明> <grep 到的判定命令>
+            if eval "$2"; then echo "OK   $1"; else echo "!!   $1"; FAIL=1; fi
+          }
+
           echo "=== env 位置配置 ==="
-          grep -E '^(CONFIG_ENV_OFFSET|CONFIG_ENV_SIZE|CONFIG_ENV_IS_IN_MTD|CONFIG_ENV_MTD_DEV|CONFIG_ENV_MTD_NAME)=' uboot-mtk-20250711/.config || true
-          echo "=== 编译进去的 bootcmd ==="
-          grep -E 'define CONFIG_(USE_BOOTCOMMAND|BOOTCOMMAND)' uboot-mtk-20250711/include/config/autoconf.h \
-            || echo '!! 没有 CONFIG_BOOTCOMMAND, 刷上不会自动启动'
-          echo "=== MTD / NMBM（关错会链接失败）==="
-          grep -E '^(CONFIG_MTD|CONFIG_DM_MTD|CONFIG_MTD_SPI_NAND|CONFIG_ENABLE_NAND_NMBM|CONFIG_NMBM|CONFIG_NMBM_MTD)=' uboot-mtk-20250711/.config || true
-          grep -q '^CONFIG_MTD=y' uboot-mtk-20250711/.config \
-            && echo 'OK  MTD=y' \
-            || echo '!!  CONFIG_MTD 不是 y —— 链接会挂: undefined reference to mtd_read/mtd_write/mtd_erase'
-          echo "=== 开机菜单 / 倒计时 ==="
-          grep -E '^(CONFIG_AUTOBOOT_MENU_SHOW|CONFIG_AUTOBOOT_MENU_MTK_SHOW|CONFIG_MEDIATEK_BOOTMENU|CONFIG_BOOTDELAY|CONFIG_BOOTMENU_DISABLE_UBOOT_CONSOLE)=' uboot-mtk-20250711/.config || true
-          grep -E 'define CONFIG_(AUTOBOOT_MENU_SHOW|AUTOBOOT_MENU_MTK_SHOW|MEDIATEK_BOOTMENU)' uboot-mtk-20250711/include/config/autoconf.h \
-            && echo '!! 菜单还开着, bootcmd 可能轮不到执行' || echo 'OK 菜单已关'
+          grep -E '^(CONFIG_ENV_OFFSET|CONFIG_ENV_SIZE|CONFIG_ENV_SIZE_REDUND|CONFIG_ENV_IS_IN_MTD|CONFIG_ENV_MTD_DEV|CONFIG_ENV_MTD_NAME)=' "$CFG" || true
+
+          echo "=== 1. bootcmd 编进去了吗 ==="
+          grep -E 'define CONFIG_(USE_BOOTCOMMAND|BOOTCOMMAND)' "$AUTOCONF" || true
+          chk 'CONFIG_USE_BOOTCOMMAND=y'   'grep -q "^#define CONFIG_USE_BOOTCOMMAND" "$AUTOCONF"'
+          chk 'CONFIG_BOOTCOMMAND 非空'    'grep -q "^#define CONFIG_BOOTCOMMAND" "$AUTOCONF"'
+
+          echo "=== 2. MTD / NMBM（关错会 undefined reference to mtd_*）==="
+          grep -E '^(CONFIG_MTD|CONFIG_DM_MTD|CONFIG_MTD_SPI_NAND|CONFIG_ENABLE_NAND_NMBM|CONFIG_NMBM|CONFIG_NMBM_MTD)=' "$CFG" || true
+          chk 'CONFIG_MTD=y' 'grep -q "^CONFIG_MTD=y" "$CFG"'
+
+          echo "=== 3. 开机菜单补丁（应改源码而不是关 Kconfig）==="
+          # 三个宏必须保持全开: 关 MEDIATEK_BOOTMENU 会丢 mtd_helper.o(备份/刷机挂),
+          # 关 AUTOBOOT_MENU_SHOW 会丢 menu_show(链接挂)。菜单靠补丁跳过。
+          grep -E '^(CONFIG_MENU|CONFIG_CMD_BOOTMENU|CONFIG_MEDIATEK_BOOTMENU|CONFIG_AUTOBOOT_MENU_SHOW|CONFIG_AUTOBOOT_MENU_MTK_SHOW)=' "$CFG" || true
+          chk 'MEDIATEK_BOOTMENU=y（否则备份/刷机没 mtd_helper）' \
+              'grep -q "^CONFIG_MEDIATEK_BOOTMENU=y" "$CFG"'
+          chk 'AUTOBOOT_MENU_SHOW=y（否则 menu_show 没定义, 链接挂）' \
+              'grep -q "^CONFIG_AUTOBOOT_MENU_SHOW=y" "$CFG"'
+          chk 'autoboot.c 菜单开关已被改成 if (0)' \
+              'grep -q "if (0) { /\* 360T7" uboot-mtk-20250711/common/autoboot.c'
+
+          echo "=== 4. 倒计时 ==="
+          grep -E '^(CONFIG_BOOTDELAY|CONFIG_AUTOBOOT)=' "$CFG" || true
+          chk 'CONFIG_BOOTDELAY>=0' 'grep -qE "^CONFIG_BOOTDELAY=[0-9-]+$" "$CFG"'
+
+          echo "=== 5. 默认 env 里的 bootcmd ==="
           for h in uboot-mtk-20250711/include/generated/defaultenv_autogenerated.h \
                    uboot-mtk-20250711/include/generated/defaultenv.h; do
-            [ -f "$h" ] && grep -o 'bootcmd=[^"]*' "$h"
+            [ -f "$h" ] && { grep -o 'bootcmd=[^"]*' "$h" || true; }
           done
+
           echo "=== 产物 ==="
           ls -l output/
+
+          echo
+          if [ "$FAIL" = "0" ]; then
+            echo "===== 自检通过: 可以刷 ====="
+          else
+            echo "===== 自检未通过: 上面带 !! 的项要修, 先别刷 ====="
+          fi
+          exit 0
 
       - name: 整理产物
         run: |
